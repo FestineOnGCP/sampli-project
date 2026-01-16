@@ -131,3 +131,125 @@ jobs:
           
           echo "CloudFront URL: $(terraform output -raw cloudfront_url)"
           echo "ALB DNS: $(terraform output -raw alb_dns_name)"
+          
+          # Save outputs for next job
+          echo "CLUSTER_NAME=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_ENV
+          echo "SERVICE_NAME=$(terraform output -raw ecs_service_name)" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY_URL=$(terraform output -raw ecr_repository_url)" >> $GITHUB_ENV
+
+  deploy-ecs:
+    name: Deploy Image to ECS
+    runs-on: ubuntu-latest
+    needs: terraform-deploy
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Initialize Terraform (for outputs only)
+        working-directory: ./terraform
+        run: terraform init -backend=false
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Get Current Task Definition
+        id: task-def
+        run: |
+          CLUSTER_NAME=$(terraform -chdir=./terraform output -raw ecs_cluster_name)
+          SERVICE_NAME=$(terraform -chdir=./terraform output -raw ecs_service_name)
+          
+          TASK_DEFINITION_ARN=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          
+          echo "TASK_DEFINITION_ARN=$TASK_DEFINITION_ARN" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+          echo "SERVICE_NAME=$SERVICE_NAME" >> $GITHUB_ENV
+          
+          # Get task definition JSON
+          aws ecs describe-task-definition \
+            --task-definition $TASK_DEFINITION_ARN \
+            --query 'taskDefinition' > task-definition.json
+
+      - name: Update Task Definition with New Image
+        run: |
+          ECR_REPO_URL=$(terraform -chdir=./terraform output -raw ecr_repository_url)
+          NEW_IMAGE="$ECR_REPO_URL:latest"
+          
+          echo "Updating task definition with image: $NEW_IMAGE"
+          
+          # Use jq to update the image in the task definition
+          jq ".containerDefinitions[0].image = \"$NEW_IMAGE\"" task-definition.json > updated-task-definition.json
+          
+          # Remove fields that can't be included in register-task-definition
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' updated-task-definition.json > final-task-definition.json
+
+      - name: Register New Task Definition
+        id: register-task
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://final-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "NEW_TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+          echo "Registered new task definition: $TASK_DEF_ARN"
+
+      - name: Update ECS Service
+        run: |
+          echo "Updating ECS service with new task definition..."
+          aws ecs update-service \
+            --cluster ${{ env.CLUSTER_NAME }} \
+            --service ${{ env.SERVICE_NAME }} \
+            --task-definition ${{ env.NEW_TASK_DEF_ARN }} \
+            --force-new-deployment \
+            --query 'service.serviceName' \
+            --output text
+          
+          echo "ECS service update initiated"
+
+      - name: Wait for Service to Stabilize
+        run: |
+          echo "Waiting for ECS service to reach stable state..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.CLUSTER_NAME }} \
+            --services ${{ env.SERVICE_NAME }}
+          
+          echo "ECS service is now stable with new deployment"
+
+      - name: Get Deployment Status
+        run: |
+          echo "## ECS Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          DEPLOYMENT=$(aws ecs describe-services \
+            --cluster ${{ env.CLUSTER_NAME }} \
+            --services ${{ env.SERVICE_NAME }} \
+            --query 'services[0].deployments[0]' \
+            --output json)
+          
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: $(echo $DEPLOYMENT | jq -r '.status')" >> $GITHUB_STEP_SUMMARY
+          echo "- Desired Count: $(echo $DEPLOYMENT | jq -r '.desiredCount')" >> $GITHUB_STEP_SUMMARY
+          echo "- Running Count: $(echo $DEPLOYMENT | jq -r '.runningCount')" >> $GITHUB_STEP_SUMMARY
+          echo "- Task Definition: $(echo $DEPLOYMENT | jq -r '.taskDefinition')" >> $GITHUB_STEP_SUMMARY
+          
+          echo "Deployment completed successfully!"

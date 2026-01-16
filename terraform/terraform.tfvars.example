@@ -1,0 +1,29 @@
+# AWS Configuration
+aws_region = "us-east-1"
+
+# Project Configuration
+project_name = "flask-ip-app"
+
+# VPC Configuration
+vpc_cidr = "10.0.0.0/16"
+
+# ECR Configuration
+ecr_repository_name = "flask-ip-app"
+
+# Container Configuration
+container_port = 5000
+
+# ECS Task Configuration
+task_cpu    = 256
+task_memory = 512
+
+# ECS Service Configuration
+desired_count = 1
+
+# Container Environment Variables (optional)
+# container_environment = [
+#   {
+#     name  = "ENV_VAR_NAME"
+#     value = "ENV_VAR_VALUE"
+#   }
+# ]

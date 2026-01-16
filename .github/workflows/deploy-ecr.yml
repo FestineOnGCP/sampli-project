@@ -42,6 +42,21 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
 
+      - name: Create ECR Repository if it doesn't exist
+        run: |
+          # Check if repository exists
+          if ! aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "Creating ECR repository: ${{ env.ECR_REPOSITORY }}"
+            aws ecr create-repository \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --region ${{ env.AWS_REGION }} \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE
+            echo "ECR repository created successfully"
+          else
+            echo "ECR repository already exists: ${{ env.ECR_REPOSITORY }}"
+          fi
+
       - name: Build, tag, and push image to Amazon ECR
         id: build-image
         env:
